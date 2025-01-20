@@ -1,0 +1,10 @@
+<configuration>
+    <input>
+        <net-file value="C:/Users/pc/Documents/Trafic/data/sumo/network.net.xml"/>
+        <route-files value="C:/Users/pc/Documents/Trafic/data/sumo/traffic.trips.xml"/>
+    </input>
+    <time>
+        <begin value="0"/>
+        <end value="3600"/>
+    </time>
+</configuration>
