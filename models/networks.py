@@ -4,6 +4,75 @@ import torch.nn.functional as F
 from ray.rllib.core.rl_module.rl_module import RLModule
 from ray.rllib.utils.annotations import override
 from gymnasium.spaces import Dict, Discrete, Box
+from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
+
+
+
+
+
+
+class MyTrafficModel(TorchModelV2, nn.Module):
+    def __init__(self, obs_space, action_space, num_outputs, model_config, name):
+        TorchModelV2.__init__(self, obs_space, action_space, num_outputs, model_config, name)
+        nn.Module.__init__(self)
+
+        # Calculate input size from observation space
+        input_size = 15  
+        hidden_size = 256
+
+        # Use LayerNorm for better stability
+        self.input_norm = nn.LayerNorm(input_size)
+        
+        self.network = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_size),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.LayerNorm(hidden_size)
+        )
+
+        # Separate heads for discrete and continuous actions
+        self.discrete_head = nn.Linear(hidden_size, 3)  # 3 phases
+        self.continuous_mean = nn.Linear(hidden_size, 1)  # Duration mean
+        self.continuous_log_std = nn.Parameter(torch.zeros(1))  # Learnable but shared log_std
+
+        self.value_branch = nn.Linear(hidden_size, 1)
+        self._value_out = None
+    def forward(self, input_dict, state, seq_lens):
+        obs = input_dict["obs_flat"].float()
+        
+        # Normalize inputs
+        x = self.input_norm(obs)
+        
+        # Main network
+        features = self.network(x)
+        
+        # Discrete action logits (phases)
+        phase_logits = self.discrete_head(features)
+        
+        # Continuous action (duration)
+        duration_mean = self.continuous_mean(features)
+        
+        # Bound the mean to avoid extreme values
+        duration_mean = torch.tanh(duration_mean) * 27.5 + 32.5  # Maps to [5, 60]
+        
+        # Use a single learnable log_std with clipping
+        log_std = torch.clamp(self.continuous_log_std, -20.0, 2.0)
+        log_std = log_std.expand_as(duration_mean)
+        
+        # Combine outputs
+        model_out = torch.cat([phase_logits, duration_mean, log_std], dim=-1)
+        
+        # Value function
+        self._value_out = self.value_branch(features).squeeze(-1)
+        
+        return model_out, state
+
+    def value_function(self):
+        return self._value_out
+
+
 
 class CentralizedCriticRLModule(RLModule):
     def __init__(self, observation_space, action_space, **kwargs):
@@ -59,12 +128,25 @@ class CentralizedCriticRLModule(RLModule):
                 mean, log_std = output[..., :action_dim], output[..., action_dim:]
                 
                 # Clamp log_std for numerical stability
-                log_std = torch.clamp(log_std, -20, 2)
                 
                 # Scale mean to action space range
-                scaled_mean = (space.high - space.low) * torch.sigmoid(mean) + space.low
                 
+
+                # 1) Narrow the clamp range so exp(-10) ~ 4.54e-5 (less likely to underflow to 0).
+                log_std = torch.clamp(log_std, -10.0, 2.0)
+                scale = torch.exp(log_std).clamp_min(1e-6)
+                log_std = torch.log(scale)
+
+                # 2) Or, add an epsilon clamp:
+                # scale = torch.exp(log_std).clamp_min(1e-6)
+                # log_std = torch.log(scale)
+
+                # Scale mean to [space.low, space.high].
+                scaled_mean = (space.high - space.low) * torch.sigmoid(mean) + space.low
+
+
                 action_outputs[key] = torch.cat([scaled_mean, log_std], dim=-1)
+
         
         return action_outputs
 
