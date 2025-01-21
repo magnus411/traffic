@@ -1,3 +1,4 @@
+
 from ray.rllib.algorithms.ppo import PPOConfig
 from ray.air import RunConfig
 import os
@@ -104,12 +105,13 @@ def get_ma_training_config():
             }
         )
         .framework("torch")
+        .resources(num_gpus=1)
         .env_runners(
-            num_env_runners=1,
-            num_envs_per_env_runner=1,
+            num_env_runners=4,
+            num_envs_per_env_runner=2,
             rollout_fragment_length=200, 
             sample_timeout_s=180,
-        ) 
+        )
         .training(
             train_batch_size=6000,
             num_epochs=10,
@@ -135,26 +137,24 @@ def get_ma_training_config():
                 "log_metrics_tables": True,
             }
         )
-
         .multi_agent(
             policies={
                 "shared_policy": (
-                    None,  # uses default (Torch)PPOPolicy
+                    None,  
                     temp_env.single_light_obs_space,
                     temp_env.single_light_act_space,
                     {
                         "model": {
                             "custom_model": "my_traffic_model",
-                            # optionally pass custom_model_config
+                            
+                           
                         },
                     },
                 )
             },
             policy_mapping_fn=my_policy_mapping,
         )
-        .resources(num_gpus=1)
 
     )
     return config
-
 

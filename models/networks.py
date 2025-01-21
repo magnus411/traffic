@@ -40,8 +40,9 @@ class MyTrafficModel(TorchModelV2, nn.Module):
         self.value_branch = nn.Linear(hidden_size, 1)
         self._value_out = None
     def forward(self, input_dict, state, seq_lens):
+        # Ensure the model weights and input data are on the same device
         obs = input_dict["obs_flat"].float()
-        
+
         # Normalize inputs
         x = self.input_norm(obs)
         
@@ -53,20 +54,17 @@ class MyTrafficModel(TorchModelV2, nn.Module):
         
         # Continuous action (duration)
         duration_mean = self.continuous_mean(features)
-        
-        # Bound the mean to avoid extreme values
         duration_mean = torch.tanh(duration_mean) * 27.5 + 32.5  # Maps to [5, 60]
-        
-        # Use a single learnable log_std with clipping
+
         log_std = torch.clamp(self.continuous_log_std, -20.0, 2.0)
         log_std = log_std.expand_as(duration_mean)
-        
+
         # Combine outputs
         model_out = torch.cat([phase_logits, duration_mean, log_std], dim=-1)
-        
+
         # Value function
         self._value_out = self.value_branch(features).squeeze(-1)
-        
+
         return model_out, state
 
     def value_function(self):

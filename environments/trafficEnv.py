@@ -9,7 +9,7 @@ import ray
 from ray import tune
 from ray.tune import Tuner
 from ray.air import RunConfig
-import time
+
 from ray.rllib.env.multi_agent_env import MultiAgentEnv
 from ray.rllib.models.modelv2 import ModelV2
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
@@ -89,7 +89,7 @@ class TrafficLightMAEnv(MultiAgentEnv):
         while retry_count < max_retries:
             try:
                 sumo_cmd = [
-                    "sumo-gui",
+                    "sumo",
                     "-c", self.sumo_cfg,
                     "--start",
                     "--quit-on-end", "true",
@@ -223,7 +223,7 @@ class TrafficLightMAEnv(MultiAgentEnv):
     # -------------------------
     def _get_observation(self, light_id):
         """
-        Build the observation for one traffic light `light_id`.
+        Build the observation for one traffic light light_id.
         We'll gather up to 4 lanes' queue lengths and waiting times,
         as well as the current 0..2 phase.
         """
@@ -299,4 +299,3 @@ class TrafficLightMAEnv(MultiAgentEnv):
             except traci.exceptions.TraCIException:
                 pass
         return result
-
