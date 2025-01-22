@@ -41,8 +41,10 @@ class TrafficLightEnv(gym.Env):
             light_id: gym.spaces.Dict({
                 "local_state": gym.spaces.Dict({
                     "queue_length": gym.spaces.Box(low=0, high=100, shape=(4,), dtype=np.float32),
-                    "current_phase": gym.spaces.Box(low=0, high=2, shape=(1,), dtype=np.float32),  # Changed to Box
+                    "current_phase": gym.spaces.Box(low=0, high=2, shape=(1,), dtype=np.float32),
                     "waiting_time": gym.spaces.Box(low=0, high=1e6, shape=(4,), dtype=np.float32),
+                    "lane_density": gym.spaces.Box(low=0, high=1, shape=(4,), dtype=np.float32),
+                    "mean_speed": gym.spaces.Box(low=0, high=30, shape=(4,), dtype=np.float32),
                 }),
             }) for light_id in self.light_ids
         })
@@ -102,30 +104,88 @@ class TrafficLightEnv(gym.Env):
         return obs, rewards, terminated, truncated, info
     def _get_observation(self, light_id):
         """Get the observation for a specific traffic light."""
-        queue_length = self._get_queue_length(light_id)  # Shape: [4]
-        waiting_time = self._get_waiting_time(light_id)  # Shape: [4]
+        lanes = traci.trafficlight.getControlledLanes(light_id)
         
-        # Keep current_phase as a 1D array with shape (1,)
+        queue_length = self._get_queue_length(light_id)
+        waiting_time = self._get_waiting_time(light_id)
         current_phase = np.array([traci.trafficlight.getPhase(light_id) % 3], dtype=np.float32)
+        
+        # Add these new observations
+        lane_density = np.zeros(4, dtype=np.float32)
+        mean_speed = np.zeros(4, dtype=np.float32)
+        
+        for i in range(min(4, len(lanes))):
+            lane_id = lanes[i]
+            try:
+                # Get density (vehicles per meter)
+                lane_length = traci.lane.getLength(lane_id)
+                num_vehicles = traci.lane.getLastStepVehicleNumber(lane_id)
+                lane_density[i] = num_vehicles / lane_length if lane_length > 0 else 0
+                
+                # Get mean speed
+                mean_speed[i] = traci.lane.getLastStepMeanSpeed(lane_id)
+            except traci.exceptions.TraCIException:
+                pass
         
         return {
             "local_state": {
                 "queue_length": queue_length,
-                "current_phase": current_phase,  # Now shape is (1,)
+                "current_phase": current_phase,
                 "waiting_time": waiting_time,
+                "lane_density": lane_density,
+                "mean_speed": mean_speed
             }
         }
-
     def _compute_reward(self, light_id):
-        """Compute reward for a specific traffic light."""
+        """
+        Compute reward for a specific traffic light.
+        Rewards efficient traffic flow and penalizes congestion and waiting.
+        """
+        # Base metrics
         queue_length = np.sum(self._get_queue_length(light_id))
         waiting_time = np.sum(self._get_waiting_time(light_id)) / 100.0
-        throughput = sum(
-            traci.lane.getLastStepVehicleNumber(lane) for lane in traci.trafficlight.getControlledLanes(light_id)[:4]
+        
+        # Get controlled lanes
+        lanes = traci.trafficlight.getControlledLanes(light_id)[:4]
+        
+        # Throughput: number of vehicles that passed through
+        throughput = sum(traci.lane.getLastStepVehicleNumber(lane) for lane in lanes)
+        
+        # Speed efficiency: ratio of current speed to max speed
+        speed_scores = []
+        for lane in lanes:
+            mean_speed = traci.lane.getLastStepMeanSpeed(lane)
+            max_speed = traci.lane.getMaxSpeed(lane)
+            if max_speed > 0:
+                speed_scores.append(mean_speed / max_speed)
+        speed_efficiency = np.mean(speed_scores) if speed_scores else 0
+        
+        # Density penalty: penalize high density which indicates congestion
+        density_penalty = 0
+        for lane in lanes:
+            length = traci.lane.getLength(lane)
+            num_vehicles = traci.lane.getLastStepVehicleNumber(lane)
+            if length > 0:
+                density = num_vehicles / length
+                density_penalty += density
+        
+        # Emergency stop penalty: penalize emergency stops which indicate poor timing
+        emergency_stops = sum(traci.lane.getLastStepHaltingNumber(lane) for lane in lanes)
+        
+        # Combine all factors into final reward
+        reward = (
+            throughput * 2.0 +                    # Reward for throughput
+            speed_efficiency * 5.0 -              # Reward for maintaining speed
+            queue_length * 0.5 -                  # Penalty for queues
+            waiting_time * 0.3 -                  # Penalty for waiting time
+            density_penalty * 2.0 -               # Penalty for congestion
+            emergency_stops * 1.0                 # Penalty for emergency stops
         )
-        reward = throughput * 2.0 - queue_length * 0.5 - waiting_time * 0.3
+        
+        # Normalize reward to avoid extreme values
+        reward = np.clip(reward, -10.0, 10.0)
+        
         return reward
-
     # Helper methods (unchanged)
     def _start_simulation(self):
         """Start SUMO simulation with proper error handling"""
@@ -204,8 +264,8 @@ class TrafficLightModel(TorchModelV2, nn.Module):
         
         # Define sub-model for processing each traffic light's local state
         self.light_state_encoder = nn.Sequential(
-            nn.LayerNorm(12),  # Add normalization
-            nn.Linear(12, 64),
+            nn.LayerNorm(20),  # 4 + 1 + 4 + 4 + 4 = 20 features
+            nn.Linear(20, 64),
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
@@ -244,6 +304,8 @@ class TrafficLightModel(TorchModelV2, nn.Module):
             queue_length = torch.as_tensor(local_state["queue_length"], device=self.device).float()
             waiting_time = torch.as_tensor(local_state["waiting_time"], device=self.device).float() 
             current_phase = torch.as_tensor(local_state["current_phase"], device=self.device).float() 
+            lane_density = torch.as_tensor(local_state["lane_density"], device=self.device).float()
+            mean_speed = torch.as_tensor(local_state["mean_speed"], device=self.device).float()
             
             # Ensure current_phase is the right shape before expanding
             if current_phase.dim() == 1:
@@ -253,7 +315,13 @@ class TrafficLightModel(TorchModelV2, nn.Module):
             current_phase = current_phase.expand(-1, 4)
             
             # Concatenate features
-            light_obs = torch.cat([queue_length, current_phase, waiting_time], dim=-1)
+            light_obs = torch.cat([
+                queue_length,      # [batch_size, 4]
+                current_phase,     # [batch_size, 4]
+                waiting_time,      # [batch_size, 4]
+                lane_density,      # [batch_size, 4]
+                mean_speed        # [batch_size, 4]
+            ], dim=-1)  # Total shape: [batch_size, 20]
             light_features.append(self.light_state_encoder(light_obs))
         
         # Combine features from all lights
