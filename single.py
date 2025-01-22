@@ -28,20 +28,25 @@ class TrafficLightEnv(gym.Env):
             config = {}
 
         self.num_lights = config.get("num_lights", 5)
-        self.light_ids = config.get("light_ids", ["A0", "B0", "C0", "D0", "E0"][: self.num_lights])
-
+        self.light_ids = config.get("light_ids", ["301", "520", "538", "257", "138"][: self.num_lights])
         self.sumo_cfg = config.get("sumo_cfg", "data/sumo/simulation.sumocfg")
         self.max_steps = config.get("max_steps", 10000)
-
         self._is_connected = False
         self.current_step = 0
+        
+        # We'll initialize this after starting SUMO
+        self.light_phases = {}
 
+        # Use a default max phases for initialization
+        max_default_phases = 6  # Maximum possible phases any light might have
+        
         # Combined observation space
         self.observation_space = gym.spaces.Dict({
             light_id: gym.spaces.Dict({
                 "local_state": gym.spaces.Dict({
                     "queue_length": gym.spaces.Box(low=0, high=100, shape=(4,), dtype=np.float32),
-                    "current_phase": gym.spaces.Box(low=0, high=2, shape=(1,), dtype=np.float32),
+                    "current_phase": gym.spaces.Box(low=0, high=max_default_phases-1, shape=(1,), dtype=np.float32),
+                    "phase_state": gym.spaces.Box(low=0, high=1, shape=(4,), dtype=np.float32),
                     "waiting_time": gym.spaces.Box(low=0, high=1e6, shape=(4,), dtype=np.float32),
                     "lane_density": gym.spaces.Box(low=0, high=1, shape=(4,), dtype=np.float32),
                     "mean_speed": gym.spaces.Box(low=0, high=30, shape=(4,), dtype=np.float32),
@@ -49,11 +54,10 @@ class TrafficLightEnv(gym.Env):
             }) for light_id in self.light_ids
         })
 
-        # Combined action space
-        # Combined action space
+        # Combined action space with dynamic phases per light
         self.action_space = gym.spaces.Dict({
             light_id: gym.spaces.Dict({
-                "phase": gym.spaces.Discrete(3),
+                "phase": gym.spaces.Discrete(max_default_phases),  # Use max possible phases
                 "duration": gym.spaces.Box(low=5.0, high=60.0, shape=(1,), dtype=np.float32),
             }) for light_id in self.light_ids
         })
@@ -63,14 +67,18 @@ class TrafficLightEnv(gym.Env):
         self._start_simulation()
         self.current_step = 0
 
+        # Now that SUMO is started, we can get the actual phase information
+        self.light_phases = {
+            light_id: len(traci.trafficlight.getAllProgramLogics(light_id)[0].phases)
+            for light_id in self.light_ids
+        }
+
         for _ in range(10):  # Warm-up steps
             traci.simulationStep()
 
         obs = {light_id: self._get_observation(light_id) for light_id in self.light_ids}
-        # Create an empty info dict
         info = {}
         
-        # Return just observation and info
         return obs, info
     def step(self, action):
         """Execute one step of the environment."""
@@ -78,7 +86,9 @@ class TrafficLightEnv(gym.Env):
         self.current_step += 1
 
         for light_id, light_action in action.items():
-            phase = int(light_action["phase"])
+            max_phases = self.light_phases[light_id]
+
+            phase = int(light_action["phase"]) % max_phases
             # Fix the deprecation warning by extracting single value
             duration = float(light_action["duration"].item())  # Use .item() to convert to scalar
             duration = max(5.0, min(60.0, duration))
@@ -106,9 +116,27 @@ class TrafficLightEnv(gym.Env):
         """Get the observation for a specific traffic light."""
         lanes = traci.trafficlight.getControlledLanes(light_id)
         
+        # Get basic metrics
         queue_length = self._get_queue_length(light_id)
         waiting_time = self._get_waiting_time(light_id)
-        current_phase = np.array([traci.trafficlight.getPhase(light_id) % 3], dtype=np.float32)
+        
+        # Get current phase number
+        current_phase = np.array([traci.trafficlight.getPhase(light_id)], dtype=np.float32)
+        
+        # Get phase state (GGrr etc)
+        phase_state = traci.trafficlight.getRedYellowGreenState(light_id)
+        phase_features = np.zeros(4, dtype=np.float32)
+        
+        # Convert string state to numeric features
+        controlled_links = traci.trafficlight.getControlledLinks(light_id)
+        for i in range(min(4, len(controlled_links))):
+            if i < len(phase_state):
+                if phase_state[i] == 'G': 
+                    phase_features[i] = 1.0    # Green
+                elif phase_state[i] == 'y': 
+                    phase_features[i] = 0.5    # Yellow
+                elif phase_state[i] == 'r': 
+                    phase_features[i] = 0.0    # Red
         
         # Add these new observations
         lane_density = np.zeros(4, dtype=np.float32)
@@ -131,11 +159,12 @@ class TrafficLightEnv(gym.Env):
             "local_state": {
                 "queue_length": queue_length,
                 "current_phase": current_phase,
+                "phase_state": phase_features,    # Added phase state features
                 "waiting_time": waiting_time,
                 "lane_density": lane_density,
                 "mean_speed": mean_speed
             }
-        }
+        }    
     def _compute_reward(self, light_id):
         """
         Compute reward for a specific traffic light.
@@ -262,10 +291,13 @@ class TrafficLightModel(TorchModelV2, nn.Module):
         # Number of traffic lights
         self.num_lights = len(obs_space.original_space.spaces)
         
+        # Input size is 24: 6 features × 4 values each
+        input_size = 24  # queue_length(4) + current_phase(4) + phase_state(4) + waiting_time(4) + lane_density(4) + mean_speed(4)
+        
         # Define sub-model for processing each traffic light's local state
         self.light_state_encoder = nn.Sequential(
-            nn.LayerNorm(20),  # 4 + 1 + 4 + 4 + 4 = 20 features
-            nn.Linear(20, 64),
+            nn.LayerNorm(input_size),  # Normalize the 24 input features
+            nn.Linear(input_size, 64),  # First layer from 24->64 (not 20->64)
             nn.ReLU(),
             nn.Linear(64, 32),
             nn.ReLU(),
@@ -276,16 +308,15 @@ class TrafficLightModel(TorchModelV2, nn.Module):
         
         # Global feature combiner
         self.global_combiner = nn.Sequential(
-            nn.LayerNorm(combined_size),  # Add normalization
+            nn.LayerNorm(combined_size),
             nn.Linear(combined_size, 128),
             nn.ReLU(),
             nn.Linear(128, num_outputs),
-            nn.Tanh(),  # Add output activation
         )
         
         # Separate value branch
         self.value_branch = nn.Sequential(
-            nn.LayerNorm(combined_size),  # Add normalization
+            nn.LayerNorm(combined_size),
             nn.Linear(combined_size, 64),
             nn.ReLU(),
             nn.Linear(64, 1)
@@ -300,10 +331,11 @@ class TrafficLightModel(TorchModelV2, nn.Module):
         for light_id in obs:
             local_state = obs[light_id]["local_state"]
             
-            # Convert to tensors and normalize
+            # Convert all observations to tensors
             queue_length = torch.as_tensor(local_state["queue_length"], device=self.device).float()
             waiting_time = torch.as_tensor(local_state["waiting_time"], device=self.device).float() 
             current_phase = torch.as_tensor(local_state["current_phase"], device=self.device).float() 
+            phase_state = torch.as_tensor(local_state["phase_state"], device=self.device).float()  # Added this
             lane_density = torch.as_tensor(local_state["lane_density"], device=self.device).float()
             mean_speed = torch.as_tensor(local_state["mean_speed"], device=self.device).float()
             
@@ -314,14 +346,16 @@ class TrafficLightModel(TorchModelV2, nn.Module):
             # Expand current_phase from [batch_size, 1] to [batch_size, 4]
             current_phase = current_phase.expand(-1, 4)
             
-            # Concatenate features
+            # Concatenate all features
             light_obs = torch.cat([
                 queue_length,      # [batch_size, 4]
                 current_phase,     # [batch_size, 4]
+                phase_state,       # [batch_size, 4]
                 waiting_time,      # [batch_size, 4]
                 lane_density,      # [batch_size, 4]
                 mean_speed        # [batch_size, 4]
-            ], dim=-1)  # Total shape: [batch_size, 20]
+            ], dim=-1)  # Total shape: [batch_size, 24]
+            
             light_features.append(self.light_state_encoder(light_obs))
         
         # Combine features from all lights
@@ -379,14 +413,16 @@ def get_single_agent_training_config():
             sample_timeout_s=180,
         )
         .training(
-            train_batch_size=6000,
+            train_batch_size=8000,
             num_epochs=10,
             gamma=0.99,
             lr=3e-4,
             lambda_=0.95,
             clip_param=0.2,
-            vf_clip_param=10.0,
+            vf_clip_param=50.0,
             entropy_coeff=0.01,
+            kl_coeff=0.0,
+            grad_clip=1.0,
         )
         .reporting(
             metrics_num_episodes_for_smoothing=100,
@@ -451,7 +487,7 @@ def train():
                 param_space=config,
                 run_config=RunConfig(
                     storage_path=storage_path,
-                    stop={"training_iteration": 100},  # Define your stopping criteria
+                    stop={"training_iteration": 200},  # Define your stopping criteria
                     checkpoint_config=CheckpointConfig(
                         checkpoint_frequency=3,  # Save every 3 iterations
                         checkpoint_at_end=True,
