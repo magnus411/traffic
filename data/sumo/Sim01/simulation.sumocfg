@@ -1,0 +1,12 @@
+<configuration>
+    <input>
+        <net-file value="C:/Users/pc/Documents/Trafic/data/sumo/networkss.net.xml"/>
+        <route-files value="C:/Users/pc/Documents/Trafic/data/sumo/routes.rou.xml"/>
+	<additional-files value=""/>
+
+    </input>
+    <time>
+        <begin value="0"/>
+        <end value="20000"/>
+    </time>
+</configuration>
