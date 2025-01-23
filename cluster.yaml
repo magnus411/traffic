@@ -1,0 +1,45 @@
+# cluster.yaml
+
+cluster_name: traffic-light-cluster
+
+# The maximum number of workers nodes to launch
+max_workers: 30
+
+# Provider to use (e.g., local, aws, etc.)
+provider:
+  type: local
+  head_ip: <HEAD_NODE_IP>  # Replace with the head node's IP address
+
+# Specify the setup instructions for the head node
+head_node:
+  # Replace with your head node's instance type or resources
+  resources:
+    CPU: 8
+    GPU: 1  
+ 
+  ssh_user: <USERNAME> 
+
+# Specify the setup instructions for the worker nodes
+worker_nodes:
+  # Replace with your worker nodes' instance type or resources
+  resources:
+    CPU: 8
+    GPU: 1  # Adjust if GPUs are available
+  ssh_user: <USERNAME>  # Replace with your SSH username
+
+# File mount points on the head and worker nodes
+file_mounts: {
+  "/home/<USERNAME>/Trafic": "/path/to/your/project"  # Adjust paths accordingly
+}
+
+# Initialization commands to run on the head node
+
+
+# Specify whether to use GPUs
+head_node:
+  resources:
+    GPU: 1
+
+worker_nodes:
+  resources:
+    GPU: 1
