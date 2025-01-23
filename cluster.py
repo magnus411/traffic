@@ -5,6 +5,7 @@ import gymnasium as gym
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from ray.air.integrations.wandb import WandbLoggerCallback
 
 import ray
 from ray import tune
@@ -33,13 +34,6 @@ class TrafficLightEnv(gym.Env):
         self._is_connected = False
         self.current_step = 0
         
-        self.id_map = {
-            "cluster_155251477_4254141700_6744555967_78275": "301",
-            "cluster_1035391877_6451996796": "520", 
-            "cluster_163115359_2333391359_2333391361_78263_#1more": "538",
-            "cluster_105371_4425738061_4425738065_4425738069": "257",
-            "cluster_105372_4916088731_4916088738_4916088744": "138"
-        }
 
 
 
@@ -53,17 +47,21 @@ class TrafficLightEnv(gym.Env):
         self.observation_space = gym.spaces.Dict({
             light_id: gym.spaces.Dict({
                 "local_state": gym.spaces.Dict({
-                    "queue_length": gym.spaces.Box(low=0, high=100, shape=(4,), dtype=np.float32),
+                    "queue_length": gym.spaces.Box(low=0, high=120, shape=(4,), dtype=np.float32),
                     "current_phase": gym.spaces.Box(low=0, high=max_default_phases-1, shape=(1,), dtype=np.float32),
                     "phase_state": gym.spaces.Box(low=0, high=1, shape=(4,), dtype=np.float32),
                     "waiting_time": gym.spaces.Box(low=0, high=1e3, shape=(4,), dtype=np.float32),
-                    "lane_density": gym.spaces.Box(low=0, high=1, shape=(4,), dtype=np.float32),
                     "mean_speed": gym.spaces.Box(low=0, high=30, shape=(4,), dtype=np.float32),
+                    "trip_penalty": gym.spaces.Box(low=0, high=60, shape=(1,), dtype=np.float32),
+                    "idle_time": gym.spaces.Box(low=0, high=1e3, shape=(1,), dtype=np.float32),
                 }),
-            }) for light_id in self.light_ids
-        })
+                "downstream_context": gym.spaces.Dict({
+                    "total_downstream_queue": gym.spaces.Box(low=0, high=400, shape=(1,), dtype=np.float32),
+                    "avg_time_to_switch": gym.spaces.Box(low=0, high=120, shape=(1,), dtype=np.float32),
+                }),
 
-        # Combined action space with dynamic phases per light
+            }) for light_id in self.light_ids
+        })        
         self.action_space = gym.spaces.Dict({
             light_id: gym.spaces.Dict({
                 "phase": gym.spaces.Discrete(max_default_phases),  # Use max possible phases
@@ -71,15 +69,6 @@ class TrafficLightEnv(gym.Env):
             }) for light_id in self.light_ids
         })
 
-    def _translate_id(self, real_id):
-        id_map = {
-            "cluster_155251477_4254141700_6744555967_78275": "301",
-            "cluster_1035391877_6451996796": "520", 
-            "cluster_163115359_2333391359_2333391361_78263_#1more": "538",
-            "cluster_105371_4425738061_4425738065_4425738069": "257",
-            "cluster_105372_4916088731_4916088738_4916088744": "138"
-        }
-        return id_map.get(real_id, real_id)
 
 
     def reset(self, *, seed=None, options=None):
@@ -98,7 +87,6 @@ class TrafficLightEnv(gym.Env):
 
         #TEMERAROY
         obs = {light_id: self._get_observation(light_id) for light_id in self.light_ids}
-        #obs = {self._translate_id(light_id): self._get_observation(light_id) for light_id in self.light_ids}
         info = {}
         
         return obs, info
@@ -139,37 +127,56 @@ class TrafficLightEnv(gym.Env):
         }
 
         return obs, rewards, terminated, truncated, info
+    
+    def _get_downstream_lights(self, light_id):
+        downstream_lights = set()  # Use a set to avoid duplicates
+        controlled_lanes = traci.trafficlight.getControlledLanes(light_id)  # Get lanes controlled by this light
+
+        for lane_id in controlled_lanes:
+            # Get links to downstream lanes
+            links = traci.lane.getLinks(lane_id)  # Returns tuples of (next_lane_id, ...)
+            for link in links:
+                next_lane_id = link[0]  # The ID of the next lane
+                # Find the traffic light controlling the downstream lane
+                for downstream_light_id in traci.trafficlight.getIDList():
+                    if next_lane_id in traci.trafficlight.getControlledLanes(downstream_light_id):
+                        downstream_lights.add(downstream_light_id)
+
+        return list(downstream_lights)
+
     def _get_observation(self, light_id):
         """Get the observation for a specific traffic light."""
         lanes = traci.trafficlight.getControlledLanes(light_id)
         
-        # Get basic metrics
-        queue_length = self._get_queue_length(light_id)
+        # Get queue length for each lane (used in reward)
+        queue_length = self._get_queue_length(light_id)  # Shape: [4]
+        queue_length = np.clip(queue_length, 0, 120).astype(np.float32)
+
+        # Get waiting time normalized to 0-1 range (used in reward)
         waiting_time = self._get_waiting_time(light_id) / 100.0
-        waiting_time = np.clip(waiting_time, 0, 1e3)  
-        
+        waiting_time = np.clip(waiting_time, 0, 1e3)  # Prevent extreme values
+
         # Get current phase number
         current_phase = np.array([traci.trafficlight.getPhase(light_id)], dtype=np.float32)
         
-        # Get phase state (GGrr etc)
+        # Get phase state (GGrr etc.) and convert to numeric features
         phase_state = traci.trafficlight.getRedYellowGreenState(light_id)
         phase_features = np.zeros(4, dtype=np.float32)
-        
-        # Convert string state to numeric features
         controlled_links = traci.trafficlight.getControlledLinks(light_id)
         for i in range(min(4, len(controlled_links))):
             if i < len(phase_state):
                 if phase_state[i] == 'G': 
-                    phase_features[i] = 1.0    # Green
+                    phase_features[i] = 1.0  # Green
                 elif phase_state[i] == 'y': 
-                    phase_features[i] = 0.5    # Yellow
+                    phase_features[i] = 0.5  # Yellow
                 elif phase_state[i] == 'r': 
-                    phase_features[i] = 0.0    # Red
-        
-        # Add these new observations
+                    phase_features[i] = 0.0  # Red
+
+        # Initialize lane density, mean speed, and idle time
         lane_density = np.zeros(4, dtype=np.float32)
         mean_speed = np.zeros(4, dtype=np.float32)
-        
+        idle_time = np.zeros(4, dtype=np.float32)
+        # Collect lane-level metrics
         for i in range(min(4, len(lanes))):
             lane_id = lanes[i]
             try:
@@ -178,21 +185,68 @@ class TrafficLightEnv(gym.Env):
                 num_vehicles = traci.lane.getLastStepVehicleNumber(lane_id)
                 lane_density[i] = num_vehicles / lane_length if lane_length > 0 else 0
                 
-                # Get mean speed
+                # Get mean speed (m/s)
                 mean_speed[i] = traci.lane.getLastStepMeanSpeed(lane_id)
+
+                # Calculate idle time (vehicles moving below a threshold speed)
+                idle_time[i] = sum(
+                    1.0
+                    for veh in traci.lane.getLastStepVehicleIDs(lane_id)
+                    if traci.vehicle.getSpeed(veh) < 0.1
+                )
             except traci.exceptions.TraCIException:
                 pass
-        
+        idle_time = np.clip(idle_time, 0, 1e3)  
+        # Calculate additional features for trip times and trip penalty
+        trip_times = [
+            traci.vehicle.getTimeLoss(veh)
+            for lane in lanes
+            for veh in traci.lane.getLastStepVehicleIDs(lane)
+        ]
+        avg_trip_time = np.mean(trip_times) if trip_times else 0  # Average trip time
+        trip_penalty = avg_trip_time / 60.0  # Normalize to minutes
+        trip_penalty = np.clip(trip_penalty, 0, 60)  # Clip to prevent extreme values
+        # Add features as normalized values
+        trip_penalty_feature = np.array([trip_penalty], dtype=np.float32)
+        idle_time_feature = np.sum(idle_time)  # Aggregate idle time across all lanes
+
+        downstream_lights = self._get_downstream_lights(light_id)
+        total_downstream_queue = sum(np.sum(self._get_queue_length(downstream)) for downstream in downstream_lights)
+        total_downstream_queue = np.array([total_downstream_queue], dtype=np.float32)  # Shape: [1]
+        total_downstream_queue = np.clip(total_downstream_queue, 0, 400).astype(np.float32)
+
+
+
+        avg_time_to_switch = np.mean([
+            traci.trafficlight.getNextSwitch(downstream) - traci.simulation.getTime()
+            for downstream in downstream_lights
+        ]) if downstream_lights else 0.0
+        avg_time_to_switch = np.array([avg_time_to_switch], dtype=np.float32)  # Shape: [1]
+        avg_time_to_switch = np.clip(avg_time_to_switch, 0, 120).astype(np.float32)
+
+
+        # Combine all observations into a dictionary
         return {
             "local_state": {
-                "queue_length": queue_length,
-                "current_phase": current_phase,
-                "phase_state": phase_features,    # Added phase state features
-                "waiting_time": waiting_time,
-                "lane_density": lane_density,
-                "mean_speed": mean_speed
-            }
-        }    
+                "queue_length": queue_length,           # Queue lengths per lane
+                "current_phase": current_phase,         # Current phase
+                "phase_state": phase_features,          # Red-Yellow-Green state features
+                "waiting_time": waiting_time,           # Waiting time per lane
+                "mean_speed": mean_speed,               # Mean speed per lane
+                "trip_penalty": trip_penalty_feature,   # Trip penalty based on trip time
+                "idle_time": np.array([idle_time_feature], dtype=np.float32),  # Total idle time
+
+            },
+            "downstream_context": {
+                "total_downstream_queue": total_downstream_queue,
+                "avg_time_to_switch": avg_time_to_switch,
+            },
+
+
+        }
+        
+
+
     def _compute_reward(self, light_id):
         """
         Compute reward for a specific traffic light.
@@ -207,8 +261,35 @@ class TrafficLightEnv(gym.Env):
         
         # Throughput: number of vehicles that passed through
         throughput = sum(traci.lane.getLastStepVehicleNumber(lane) for lane in lanes)
-        
-        # Speed efficiency: ratio of current speed to max speed
+
+
+
+
+
+        trip_time_penalty = sum(
+            traci.vehicle.getTimeLoss(veh)
+            for lane in lanes
+            for veh in traci.lane.getLastStepVehicleIDs(lane)
+        )
+        trip_time_penalty = np.clip(trip_time_penalty / 100.0, 0, 10)
+
+
+
+        idle_time = sum(
+            1.0 for lane in lanes 
+            for veh in traci.lane.getLastStepVehicleIDs(lane)
+            if traci.vehicle.getSpeed(veh) < 0.1
+        )     
+        trip_times = [
+            traci.vehicle.getTimeLoss(veh)
+            for lane in lanes
+            for veh in traci.lane.getLastStepVehicleIDs(lane)
+        ]
+        avg_trip_time = np.mean(trip_times) if trip_times else 0  
+        trip_penalty = (avg_trip_time / 60.0) 
+
+
+
         speed_scores = []
         for lane in lanes:
             mean_speed = traci.lane.getLastStepMeanSpeed(lane)
@@ -218,27 +299,32 @@ class TrafficLightEnv(gym.Env):
         speed_efficiency = np.mean(speed_scores) if speed_scores else 0
         
         # Density penalty: penalize high density which indicates congestion
-        density_penalty = 0
-        for lane in lanes:
-            length = traci.lane.getLength(lane)
-            num_vehicles = traci.lane.getLastStepVehicleNumber(lane)
-            if length > 0:
-                density = num_vehicles / length
-                density_penalty += density
-        
+
         # Emergency stop penalty: penalize emergency stops which indicate poor timing
         emergency_stops = sum(traci.lane.getLastStepHaltingNumber(lane) for lane in lanes)
         
-        # Combine all factors into final reward
-        reward = (
-            throughput * 2.0 +                    # Reward for throughput
-            speed_efficiency * 5.0 -              # Reward for maintaining speed
-            queue_length * 0.5 -                  # Penalty for queues
-            waiting_time * 0.3 -                  # Penalty for waiting time
-            density_penalty * 2.0 -               # Penalty for congestion
-            emergency_stops * 1.0                 # Penalty for emergency stops
+
+        downstream_lights = self._get_downstream_lights(light_id)
+        downstream_queue_penalty = sum(np.sum(self._get_queue_length(downstream)) for downstream in downstream_lights)
+        synchronization_penalty = sum(
+            abs(traci.trafficlight.getPhase(light_id) - traci.trafficlight.getPhase(downstream))
+            for downstream in downstream_lights
         )
-        
+
+
+        reward = (
+                throughput * 1.5
+                + speed_efficiency * 2
+                - queue_length * 0.8
+                - waiting_time * 0.8
+                - idle_time * 1.8
+                - trip_penalty * 1.4     
+                - emergency_stops * 1
+                - downstream_queue_penalty * 0.3
+                - synchronization_penalty * 0.3
+
+        )
+                
         # Normalize reward to avoid extreme values
         reward = np.clip(reward, -10.0, 10.0)
         
@@ -258,13 +344,13 @@ class TrafficLightEnv(gym.Env):
         while retry_count < max_retries:
             try:
                 sumo_cmd = [
-                    "sumo",
+                    "sumo-gui",
                     "-c", self.sumo_cfg,
                     "--start",
                     "--quit-on-end", "true",
                     "--random",
                     "--time-to-teleport", "-1",
-                    "--waiting-time-memory", "300",
+                    "--waiting-time-memory", "500",
                     "--no-warnings", "true"  # Reduce warning spam
                 ]
                 
@@ -320,7 +406,8 @@ class TrafficLightModel(TorchModelV2, nn.Module):
         self.num_lights = len(obs_space.original_space.spaces)
         
         # Input size is 24: 6 features × 4 values each
-        input_size = 24  # queue_length(4) + current_phase(4) + phase_state(4) + waiting_time(4) + lane_density(4) + mean_speed(4)
+        input_size = 24  # queue_length(4) + current_phase(4) + phase_state(4) + waiting_time(4) + 
+                        #  + mean_speed(4) +  + trip_penalty(1) + idle_time(1)
         
         # Define sub-model for processing each traffic light's local state
         self.light_state_encoder = nn.Sequential(
@@ -362,13 +449,17 @@ class TrafficLightModel(TorchModelV2, nn.Module):
             
             # Convert all observations to tensors
             queue_length = torch.as_tensor(local_state["queue_length"], device=self.device).float()
-            waiting_time = torch.as_tensor(local_state["waiting_time"], device=self.device).float() 
-            current_phase = torch.as_tensor(local_state["current_phase"], device=self.device).float() 
-            phase_state = torch.as_tensor(local_state["phase_state"], device=self.device).float()  # Added this
-            lane_density = torch.as_tensor(local_state["lane_density"], device=self.device).float()
+            waiting_time = torch.as_tensor(local_state["waiting_time"], device=self.device).float()
+            current_phase = torch.as_tensor(local_state["current_phase"], device=self.device).float()
+            phase_state = torch.as_tensor(local_state["phase_state"], device=self.device).float()
             mean_speed = torch.as_tensor(local_state["mean_speed"], device=self.device).float()
+            trip_penalty = torch.as_tensor(local_state["trip_penalty"], device=self.device).float()
+            idle_time = torch.as_tensor(local_state["idle_time"], device=self.device).float()
             
-                        
+            downstream_context = obs[light_id]["downstream_context"]
+            total_downstream_queue = torch.as_tensor(downstream_context["total_downstream_queue"], device=self.device).float()
+            avg_time_to_switch = torch.as_tensor(downstream_context["avg_time_to_switch"], device=self.device).float()
+
 
 
             # Ensure current_phase is the right shape before expanding
@@ -380,15 +471,17 @@ class TrafficLightModel(TorchModelV2, nn.Module):
             
             # Concatenate all features
             light_obs = torch.cat([
-                queue_length,      # [batch_size, 4]
-                current_phase,     # [batch_size, 4]
-                phase_state,       # [batch_size, 4]
-                waiting_time,      # [batch_size, 4]
-                lane_density,      # [batch_size, 4]
-                mean_speed        # [batch_size, 4]
-            ], dim=-1)  # Total shape: [batch_size, 24]
-            
-            encoded = self.light_state_encoder(light_obs)
+                queue_length,  # Shape: (4,)
+                current_phase,  # Shape: (1,)
+                phase_state,  # Shape: (4,)
+                waiting_time,  # Shape: (4,)
+                mean_speed,  # Shape: (4,)
+                trip_penalty,  # Shape: (1,)
+                idle_time,  # Shape: (1,)
+                total_downstream_queue,  # Shape: (1,)
+                avg_time_to_switch,  # Shape: (1,)
+            ], dim=-1)
+                
 
 
             light_features.append(self.light_state_encoder(light_obs))
@@ -441,21 +534,21 @@ def get_single_agent_training_config():
             },
         )
         .framework("torch")
-        .resources(num_gpus=10)
+        .resources(num_gpus=1)
         .env_runners(
             num_env_runners=4,
             num_envs_per_env_runner=2,
             rollout_fragment_length=200,
-            sample_timeout_s=180,
+            sample_timeout_s=320,
         )
         .training(
-            train_batch_size=12000,
-            num_epochs=13,
+            train_batch_size=16000,
+            num_epochs=16,
             gamma=0.99,
             lr=1e-4,
             lambda_=0.95,
             clip_param=0.2,
-            vf_clip_param=30.0,
+            vf_clip_param=20.0,
             entropy_coeff=0.01,
             kl_coeff=0.0,
             grad_clip=1.0,
@@ -497,7 +590,8 @@ def train():
     torch.autograd.set_detect_anomaly(True)
 
     # Initialize Ray (connect to existing cluster)
-    ray.init(address='auto')  # Automatically detects the cluster address
+    #ray.init(address='auto')  # Automatically detects the cluster address
+    ray.init()  # Automatically detects the cluster address
 
     print("Connected to Ray cluster.")
     print("Available GPU IDs:", ray.get_gpu_ids())
@@ -533,6 +627,12 @@ def train():
                     checkpoint_frequency=3,  # Save every 3 iterations
                     checkpoint_at_end=True,
                 ),
+                callbacks=[
+                    WandbLoggerCallback(
+                        project="Traffic", api_key="f16cce37f90a1ffe6dc3741f0f86df10cc04baed", log_config=True
+                )
+        ]
+
             ),
         )       
 
@@ -543,3 +643,6 @@ def train():
     best_checkpoint = best_result.checkpoint
     print("Best checkpoint:", best_checkpoint)
 
+
+if __name__ == "__main__":
+    train()
