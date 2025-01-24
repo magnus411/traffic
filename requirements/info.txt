@@ -3,12 +3,17 @@ set PYTHONPATH=%PYTHONPATH%;C:\Path\To\Sumo\tools
 python -m venv traffic_rl_env
 source traffic_rl_env/bin/activate  # On Windows: traffic_rl_env\Scripts\activate
 
-pip install torch==2.0.1+cu117 torchvision==0.15.2+cu117 torchaudio==2.0.2+cu117 --extra-index-url https://download.pytorch.org/whl/cu117
+pip install torch==2.0.0+cu117 --extra-index-url https://download.pytorch.org/whl/cu117
 pip install ray[default] 
 pip install gymnasium
 pip install matplotlib
 pip install 
 
+
+pandas
+pyarrow
+pip install "ray[train]"
+pip install dm_tree
 cd Desktop
 mkdir traffic
 cd traffic

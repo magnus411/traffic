@@ -30,5 +30,10 @@
     <gui_only>
         <gui-settings-file value="osm.view.xml"/>
     </gui_only>
+        <time>
+        <begin value="3000"/>
+        <end value="20000"/>
+    </time>
+
 
 </sumoConfiguration>
