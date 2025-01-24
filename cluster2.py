@@ -6,6 +6,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from ray.air.integrations.wandb import WandbLoggerCallback
+from ray.util.placement_group import (
+    placement_group,
+    placement_group_table,
+    remove_placement_group,
+)
+from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.train.torch import TorchConfig, TorchTrainer
+from ray.train import ScalingConfig
 
 import ray
 from ray import tune
@@ -99,7 +107,7 @@ class TrafficLightEnv(gym.Env):
             "cluster_163115359_2333391359_2333391361_78263_#1more",
             "cluster_105371_4425738061_4425738065_4425738069",
             "cluster_105372_4916088731_4916088738_4916088744"][:self.num_lights])
-        self.sumo_cfg = self.config.get("sumo_cfg", "data/sumo/simulation.sumocfg")
+        self.sumo_cfg = self.config.get("sumo_cfg", "C:/Users/support/Desktop/Sim03/osm.sumocfg")
         self.max_steps = self.config.get("max_steps", 10000)
         
         # Cache frequently accessed data
@@ -361,7 +369,7 @@ class TrafficLightEnv(gym.Env):
         for attempt in range(retries):
             try:
                 sumo_cmd = [
-                    "sumo" if self.config.get("gui", True) else "sumo",
+                    "sumo-gui" if self.config.get("gui", True) else "sumo",
                     "-c", self.sumo_cfg,
                     "--start",
                     "--quit-on-end", "true",
@@ -529,18 +537,25 @@ def get_single_agent_training_config():
             env=TrafficLightEnv,
             env_config={
                 "num_lights": 5,
-                "sumo_cfg": r"C:\Users\pc\Documents\Trafic\data\sumo\Sim03\osm.sumocfg",
+                "sumo_cfg": r"\\WIN-Q5NH2TGKKGM\RLTraffic\data\sumo\Sim03\osm.sumocfg",
                 "max_steps": 18000,
             },
         )
         .framework("torch")
         .resources(num_gpus=1)
         .env_runners(
-            num_env_runners=8,
+            num_env_runners=20,
             num_envs_per_env_runner=1,
             rollout_fragment_length="auto",
             sample_timeout_s=320,
         )
+        .learners(
+            num_learners=2,
+            num_cpus_per_learner=1,
+            num_gpus_per_learner=1,
+
+        )
+
         .training(
             train_batch_size=16000,
             num_epochs=16,
@@ -550,7 +565,7 @@ def get_single_agent_training_config():
             clip_param=0.2,
             vf_clip_param=20.0,
             entropy_coeff=0.01,
-            kl_coeff=0.0,
+            kl_coeff=0.1,
             grad_clip=1.0,
         )
         .reporting(
@@ -584,23 +599,18 @@ from ray.air import RunConfig, CheckpointConfig  # Added CheckpointConfig import
 
 
 
-
 def train():
     # Enable anomaly detection for debugging
     torch.autograd.set_detect_anomaly(True)
     torch.backends.cudnn.benchmark = True  
     # Initialize Ray (connect to existing cluster)
-    #ray.init(address='auto')  # Automatically detects the cluster address
-    ray.init()  # Automatically detects the cluster address
+    ray.init(address="auto")  # Automatically detects the cluster address
 
-    print("Connected to Ray cluster.")
-    print("Available GPU IDs:", ray.get_gpu_ids())
-    print("Available resources:", ray.available_resources())
 
     config = get_single_agent_training_config()
 
     # Define the storage path where checkpoints are saved
-    storage_path = os.path.abspath("./results")
+    storage_path = r"\\WIN-Q5NH2TGKKGM\RLTraffic\ClusterResults"
     os.makedirs(storage_path, exist_ok=True)
 
     # Optionally, handle checkpoint restoration if needed
@@ -622,11 +632,12 @@ def train():
             param_space=config,
             run_config=RunConfig(
                 storage_path=storage_path,
-                stop={"training_iteration": 600},  # Define your stopping criteria
+                stop={"training_iteration": 800},  # Define your stopping criteria
                 checkpoint_config=CheckpointConfig(
                     checkpoint_frequency=3,  # Save every 3 iterations
                     checkpoint_at_end=True,
                 ),
+
                 callbacks=[
                     WandbLoggerCallback(
                         project="Traffic", api_key="f16cce37f90a1ffe6dc3741f0f86df10cc04baed", log_config=True
@@ -634,6 +645,7 @@ def train():
         ]
 
             ),
+
         )       
 
     results = tuner.fit()
@@ -643,6 +655,3 @@ def train():
     best_checkpoint = best_result.checkpoint
     print("Best checkpoint:", best_checkpoint)
 
-
-if __name__ == "__main__":
-    train()

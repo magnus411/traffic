@@ -5,13 +5,13 @@ from ray.rllib.algorithms.ppo import PPO
 from ray.rllib.models import ModelCatalog
 import matplotlib.pyplot as plt
 from scipy.stats import ttest_ind
-from single import TrafficLightEnv, TrafficLightModel
-
+from cluster2 import TrafficLightEnv, TrafficLightModel
+import ray
 
 def run_baseline():
     sumo_cmd = [
         "sumo",
-        "-c", r"C:\Users\pc\Documents\Trafic\data\sumo\simulation.sumocfg",
+        "-c", r"C:\Users\pc\Documents\Trafic\data\sumo\Sim03\osm.sumocfg",
         "--start",
         "--quit-on-end", "true",
         "--random"
@@ -19,7 +19,7 @@ def run_baseline():
     traci.start(sumo_cmd)
     stats = {"waiting_time": [], "queue_length": [], "throughput": [], "idling_time": [], "trip_time": []}
 
-    for _ in range(1000):  # Simulate 20 seconds @ 100ms steps
+    for _ in range(4000):  # Simulate 20 seconds @ 100ms steps
         traci.simulationStep()
         stats = collect_metrics(stats)
     traci.close()
@@ -30,19 +30,19 @@ def run_baseline():
 
 def run_rl_agent():
     ModelCatalog.register_custom_model("my_traffic_model", TrafficLightModel)
-    checkpoint = r"C:\Users\pc\Documents\Trafic\results\PPO_2025-01-22_18-57-13\PPO_TrafficLightEnv_befd4_00000_0_2025-01-22_18-57-13\checkpoint_000065"
+    checkpoint = r"C:\Users\pc\Documents\Trafic\newRes\PPO_2025-01-24_03-51-14\PPO_TrafficLightEnv_141fd_00000_0_2025-01-24_03-51-15\checkpoint_000109"
     trained_agent = PPO.from_checkpoint(checkpoint)
     env = TrafficLightEnv({
         "num_lights": 5,
-        "sumo_cfg": r"C:\Users\pc\Documents\Trafic\data\sumo\simulation.sumocfg",
-        "max_steps": 2000
+        "sumo_cfg": r"C:\Users\pc\Documents\Trafic\data\sumo\Sim03\osm.sumocfg",
+        "max_steps": 10000
     })
 
     stats = {"waiting_time": [], "queue_length": [], "throughput": [], "idling_time": [], "trip_time": []}
     obs, _ = env.reset()
 
-    for _ in range(1000):
-        action = trained_agent.compute_single_action(obs)
+    for _ in range(4000):
+        action = trained_agent.compute_single_action(obs, explore=False)
         obs, reward, terminated, truncated, info = env.step(action)
         stats = collect_metrics(stats, obs)
         if terminated or truncated:
@@ -75,7 +75,12 @@ def collect_metrics(stats, obs=None):
                     [traci.vehicle.getTimeLoss(veh) for veh in vehicles]
                 )
     else:
-        for light_id in ["301", "520", "538", "257", "138"]:
+        for light_id in [
+            "cluster_155251477_4254141700_6744555967_78275",
+            "cluster_1035391877_6451996796",
+            "cluster_163115359_2333391359_2333391361_78263_#1more",
+            "cluster_105371_4425738061_4425738065_4425738069",
+            "cluster_105372_4916088731_4916088738_4916088744"]:
             lanes = traci.trafficlight.getControlledLanes(light_id)
             for lane in lanes:
                 total_waiting += traci.lane.getWaitingTime(lane)
@@ -146,6 +151,8 @@ def plot_comparison(baseline_stats, rl_stats):
 
 
 def compare():
+    ray.init(local_mode=True, num_cpus=2)
+
     baseline_stats = run_baseline()
     rl_stats = run_rl_agent()
 
