@@ -3,12 +3,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from ray.rllib.core.rl_module.rl_module import RLModule
 from ray.rllib.utils.annotations import override
-from gymnasium.spaces import Dict, Discrete, Box
+from gymnasium.spaces import  Discrete, Box
 from ray.rllib.models.torch.torch_modelv2 import TorchModelV2
 
+from ray.rllib.models.torch.torch_distributions import TorchDiagGaussian
 
 
-
+from ray.rllib.core.rl_module.rl_module import RLModuleConfig
+from ray.rllib.core.rl_module.torch.torch_rl_module import TorchRLModule
+from typing import Dict, Optional
 
 
 class TrafficLightModel(TorchModelV2, nn.Module):

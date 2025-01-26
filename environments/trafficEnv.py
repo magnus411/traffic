@@ -13,7 +13,7 @@ import traci
 
 class TrafficLightEnv(gym.Env):
     def _create_observation_space(self):
-        max_default_phases = 10
+        max_default_phases = 6
         return gym.spaces.Dict({
             light_id: gym.spaces.Dict({
                 "local_state": gym.spaces.Dict({
@@ -241,7 +241,7 @@ class TrafficLightEnv(gym.Env):
         reward = (
             throughput * 1.5 +
             speed_efficiency * 2 -
-            np.sum(queue_length) * 0.8 -
+            np.exp(queue_length) * 0.8 -
             np.sum(waiting_time) * 0.8 -
             idle_count * 1.8 -
             trip_penalty * 1.4 -
@@ -346,7 +346,8 @@ class TrafficLightEnv(gym.Env):
                     "--time-to-teleport", "-1",
                     "--waiting-time-memory", "500",
                     "--no-warnings", "true",
-                    "--step-length", "0.2",  
+                    "--step-length", "0.2",  # 0.2 seconds per step 
+                    "--step-method.ballistic",
                     "--no-step-log",  
                     "--threads", str(self.config.get("num_threads", 4)) 
                 ]
